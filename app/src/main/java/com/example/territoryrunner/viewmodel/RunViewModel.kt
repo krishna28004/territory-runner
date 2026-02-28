@@ -20,8 +20,10 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import org.osmdroid.util.GeoPoint
+import com.example.territoryrunner.repository.TerritoryRepository
 
 /**
  * Single source of truth for the Active Run UI.
@@ -34,10 +36,23 @@ data class RunUiState(
     val currentLocation: GeoPoint? = null
 )
 
-class RunViewModel : ViewModel() {
+class RunViewModel(private val repository: TerritoryRepository) : ViewModel() {
 
     private val _uiState = MutableStateFlow(RunUiState())
     val uiState: StateFlow<RunUiState> = _uiState.asStateFlow()
+
+    init {
+        // Load offline persisted territory state immediately on init
+        viewModelScope.launch {
+            val savedCells = repository.loadCapturedCells()
+            _uiState.update { 
+                it.copy(
+                    capturedCells = savedCells,
+                    territoryCount = savedCells.size
+                ) 
+            }
+        }
+    }
 
     private var lastValidLocation: Location? = null
     
@@ -123,12 +138,18 @@ class RunViewModel : ViewModel() {
     }
 
     private fun captureNewCell(gridId: String) {
+        val newCapturedCells = _uiState.value.capturedCells + gridId
         _uiState.update { state ->
             state.copy(
-                territoryCount = state.territoryCount + 1,
-                capturedCells = state.capturedCells + gridId,
+                territoryCount = newCapturedCells.size,
+                capturedCells = newCapturedCells,
                 eventCapture = true
             )
+        }
+
+        // Silently persist back to disk
+        viewModelScope.launch {
+            repository.saveCapturedCells(newCapturedCells)
         }
 
         viewModelScope.launch {

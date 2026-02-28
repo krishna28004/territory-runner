@@ -14,12 +14,16 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -27,6 +31,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.territoryrunner.viewmodel.RunViewModel
+import com.example.territoryrunner.viewmodel.RunViewModelFactory
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.osmdroid.config.Configuration
@@ -34,12 +39,18 @@ import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Polygon
+import org.osmdroid.views.overlay.mylocation.GpsMyLocationProvider
 import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
 
 @Composable
-fun MapScreen(viewModel: RunViewModel = viewModel()) {
+fun MapScreen(
+    viewModel: RunViewModel = viewModel(
+        factory = RunViewModelFactory(LocalContext.current)
+    )
+) {
 
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     
     val uiState by viewModel.uiState.collectAsState()
 
@@ -72,15 +83,49 @@ fun MapScreen(viewModel: RunViewModel = viewModel()) {
     }
 
     var hasAutoCentered by remember { mutableStateOf(false) }
-    var mapViewReference by remember { mutableStateOf<MapView?>(null) }
     val territoryPolygons = remember { mutableMapOf<String, Polygon>() }
+
+    val mapView = remember {
+        MapView(context).apply {
+            setTileSource(TileSourceFactory.MAPNIK)
+            setMultiTouchControls(true)
+            // Default center coordinate to avoid starting at (0,0)
+            controller.setZoom(17.0)
+            controller.setCenter(GeoPoint(39.8283, -98.5795))
+        }
+    }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                mapView.onResume()
+            } else if (event == Lifecycle.Event.ON_PAUSE) {
+                mapView.onPause()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            mapView.onDetach()
+        }
+    }
+
+    LaunchedEffect(hasLocationPermission) {
+        if (hasLocationPermission) {
+            val locationOverlay = MyLocationNewOverlay(GpsMyLocationProvider(context), mapView)
+            locationOverlay.enableMyLocation()
+            if (mapView.overlays.none { it is MyLocationNewOverlay }) {
+                mapView.overlays.add(locationOverlay)
+            }
+        }
+    }
 
     LaunchedEffect(uiState.currentLocation) {
         val currentGeoPoint = uiState.currentLocation
         
         // 1-time auto center logic!
         if (currentGeoPoint != null && !hasAutoCentered) {
-            mapViewReference?.controller?.apply {
+            mapView.controller.apply {
                 setZoom(18.0)
                 setCenter(currentGeoPoint)
             }
@@ -93,39 +138,22 @@ fun MapScreen(viewModel: RunViewModel = viewModel()) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = {
-
-                Configuration.getInstance().load(
-                    context,
-                    context.getSharedPreferences("osm", Context.MODE_PRIVATE)
-                )
-
-                val mv = MapView(context)
-                
-                mv.setTileSource(TileSourceFactory.MAPNIK)
-                mv.setMultiTouchControls(true)
-
-                if (hasLocationPermission) {
-                    val locationOverlay = MyLocationNewOverlay(mv)
-                    locationOverlay.enableMyLocation()
-                    mv.overlays.add(locationOverlay)
-                }
-
                 // ON CREATE: If the ViewModel already has captured cells (e.g. from surviving a rotation),
                 // we must immediately draw them onto this brand new MapView instance.
                 uiState.capturedCells.forEach { gridId ->
-                    val boundingBox = com.example.territoryrunner.engine.GridEngine.getGridBoundingBox(gridId)
-                    if (boundingBox.isNotEmpty()) {
-                        val gridPoints = boundingBox.map { GeoPoint(it.first, it.second) }
-                        val polygon = createTerritoryPolygon(gridPoints)
-                        
-                        // Add to both our Compose tracking state AND the physical map view
-                        territoryPolygons[gridId] = polygon
-                        mv.overlays.add(polygon)
+                    if (!territoryPolygons.containsKey(gridId)) {
+                        val boundingBox = com.example.territoryrunner.engine.GridEngine.getGridBoundingBox(gridId)
+                        if (boundingBox.isNotEmpty()) {
+                            val gridPoints = boundingBox.map { GeoPoint(it.first, it.second) }
+                            val polygon = createTerritoryPolygon(gridPoints)
+                            
+                            // Add to both our Compose tracking state AND the physical map view
+                            territoryPolygons[gridId] = polygon
+                            mapView.overlays.add(polygon)
+                        }
                     }
                 }
-
-                mapViewReference = mv
-                mv
+                mapView
             },
             update = { mv ->
                  var newOverlaysAdded = false
@@ -161,11 +189,26 @@ fun MapScreen(viewModel: RunViewModel = viewModel()) {
             onStartClick = { viewModel.toggleRun() },
             onStopClick = { viewModel.toggleRun() }
         )
-    }
 
-    DisposableEffect(Unit) {
-        onDispose {
-            mapViewReference?.onDetach()
+        // Focus My Location Button
+        FloatingActionButton(
+            onClick = {
+                uiState.currentLocation?.let { currentGeoPoint ->
+                    mapView.controller.animateTo(currentGeoPoint, 18.0, 1000L)
+                }
+            },
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(end = 24.dp, bottom = 120.dp), // Adjust padding to avoid start/stop button 
+            containerColor = MaterialTheme.colorScheme.surface,
+            contentColor = MaterialTheme.colorScheme.primary,
+            elevation = FloatingActionButtonDefaults.elevation(defaultElevation = 6.dp),
+            shape = CircleShape
+        ) {
+            Icon(
+                imageVector = Icons.Filled.LocationOn,
+                contentDescription = "Focus My Location"
+            )
         }
     }
 }
